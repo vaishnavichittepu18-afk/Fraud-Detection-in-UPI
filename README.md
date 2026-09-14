@@ -10,3 +10,4 @@ A rule-based, deterministic transaction risk analysis framework designed to secu
 ## 🛠️ Tech Stack
 * **Backend:** Python / Flask
 * **Database:** SQLite
+* **Testing:** PyTest
