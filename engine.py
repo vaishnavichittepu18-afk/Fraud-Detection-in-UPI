@@ -5,20 +5,30 @@ from difflib import SequenceMatcher
 
 class FraudEngine:
     def __init__(self):
-        self.user_history = {}      # Tracks ALL transactions per user
-        self.vpa_history = {}       # Tracks per-VPA transactions per user
+        # --- INITIALIZATION BLOCK ---
+        # Tracks live transaction velocity per user and per-VPA for anomaly detection
+        self.user_history = {}      
+        self.vpa_history = {}       
         
+        # Official corporate brands used to detect brand spoofing / impersonation
         self.official_brands = ['amazon', 'flipkart', 'zomato', 'swiggy', 'paytm', 
                                 'phonepe', 'googlepay', 'sbi', 'hdfc', 'icici']
         
+        # Suspicious keywords commonly tied to phishing, social engineering, and rewards
         self.suspicious_keywords = ['verify', 'reward', 'cashback', 'secure', 'support', 
                                     'help', 'customer', 'care', 'refund', 'prize', 
                                     'winner', 'lottery', 'gift', 'voucher']
 
+   
     def get_db_connection(self):
-        return sqlite3.connect('system.db')
-
+        # --- DATABASE CONNECTION BLOCK ---
+        # Opens and returns a connection to the local SQLite database with Row Factory enabled
+        conn = sqlite3.connect('system.db')
+        conn.row_factory = sqlite3.Row
+        return conn
     def normalize_vpa(self, text):
+        # --- VPA NORMALIZATION BLOCK ---
+        # Strips whitespaces, converts to lowercase, and removes illegal characters from a VPA string
         if not text:
             return ""
         text = str(text).lower().strip()
@@ -26,6 +36,8 @@ class FraudEngine:
         return text
 
     def extract_vpa_from_qr(self, payload):
+        # --- QR EXTRACTION BLOCK ---
+        # Parses the 'pa=' parameter out of a raw UPI QR string payload
         if not payload:
             return None
         match = re.search(r'pa=([^&]+)', payload)
@@ -34,21 +46,18 @@ class FraudEngine:
         return None
 
     def check_self_payment(self, vpa, username):
-        """Check if user is trying to pay themselves"""
+        # --- SELF-PAYMENT DETECTION BLOCK ---
+        # Prevents users from sending funds to their own handles/usernames
         if not vpa or not username:
             return False
         
         norm_vpa = self.normalize_vpa(vpa)
         norm_username = username.lower()
-        
-        # Extract username part from VPA
         vpa_username = norm_vpa.split('@')[0]
         
-        # Check if VPA username matches logged-in user
         if vpa_username == norm_username:
             return True
         
-        # Check common self-payment patterns
         self_patterns = [
             f"{norm_username}@upi",
             f"{norm_username}@paytm", 
@@ -63,6 +72,8 @@ class FraudEngine:
         return False
 
     def check_vpa_risk(self, vpa, username=None):
+        # --- VPA RISK ASSESSMENT BLOCK ---
+        # Evaluates structural validity, blacklists, spoofing, and typosquatting for a given VPA[cite: 2]
         norm_vpa = self.normalize_vpa(vpa)
         if not norm_vpa:
             return 0, ["No VPA provided"]
@@ -70,11 +81,11 @@ class FraudEngine:
         score = 0
         reasons = []
         
-        # ========== FIX: Missing '@' - Block immediately ==========
+        # Format Check: Checks if the '@' symbol is missing
         if '@' not in norm_vpa:
             return 100, ["REJECTED: Invalid UPI VPA format - Missing '@' symbol (e.g., username@bank)"]
         
-        # ========== Self-Payment Check ==========
+        # Self-Payment Prevention Rule
         if username and self.check_self_payment(norm_vpa, username):
             return 100, ["SELF-PAYMENT NOT ALLOWED: You cannot send money to yourself"]
         
@@ -84,45 +95,39 @@ class FraudEngine:
         
         conn = self.get_db_connection()
         
-        # Check verified merchant
+        # Database lookups for merchant registry, logs, reports, and blocklists
         merchant = conn.execute("SELECT name, trust_score FROM merchants WHERE vpa=?", (norm_vpa,)).fetchone()
-        
-        # Check past transactions
         past_tx = conn.execute("SELECT COUNT(*), AVG(score) FROM logs WHERE vpa=?", (norm_vpa,)).fetchone()
-        
-        # Check reports
         report_count = conn.execute("SELECT COUNT(*) as count FROM reports WHERE vpa=?", (norm_vpa,)).fetchone()
         report_count = report_count[0] if report_count else 0
-        
-        # Check blocked
         blocked = conn.execute("SELECT * FROM blocked_vpas WHERE vpa=?", (norm_vpa,)).fetchone()
         
         conn.close()
         
-        # Blocked VPA
+        # Rule: Automatically reject globally blacklisted/blocked VPAs
         if blocked:
             return 100, ["🚨 This VPA has been BLOCKED due to multiple fraud reports!"]
         
-        # Verified merchant
+        # Rule: Reward verified business entities with a safety score discount
         if merchant:
             return -50, [f"✓ Verified Merchant: {merchant['name']} (Trust Score: {merchant['trust_score']}/100)"]
         
-        # Trusted contact
+        # Rule: Reward known, safe peer contacts with established transaction histories
         if past_tx and past_tx[0] >= 2:
             avg_score = past_tx[1] if past_tx[1] else 0
             if avg_score < 30:
                 return -30, [f"✓ Known Contact: Recognized from {past_tx[0]} previous safe transactions"]
         
-        # Reported VPA
+        # Rule: Flag VPAs flagged repeatedly by other users
         if report_count >= 2:
             score += 40
             reasons.append(f"⚠️ This VPA has been reported {report_count} times for suspicious activity")
         
-        # Unverified account
+        # Rule: Penalize unrecognized, unverified personal handles acting as merchants
         score += 35
         reasons.append("⚠️ Unverified Account: This VPA is not in the verified business registry")
         
-        # Suspicious keywords
+        # Rule: Detect social engineering keywords inside the VPA prefix
         vpa_prefix = norm_vpa.split('@')[0]
         for keyword in self.suspicious_keywords:
             if keyword in vpa_prefix:
@@ -130,7 +135,7 @@ class FraudEngine:
                 reasons.append(f"🚨 Suspicious Keyword: '{keyword}' found in VPA - Common fraud pattern")
                 break
         
-        # Brand spoofing
+        # Rule: Detect brand impersonation using fuzzy matching similarity ratios
         for brand in self.official_brands:
             similarity = SequenceMatcher(None, vpa_prefix, brand).ratio()
             if brand in vpa_prefix or similarity > 0.75:
@@ -139,12 +144,12 @@ class FraudEngine:
                     reasons.append(f"🚨 BRAND SPOOFING: Account mimics '{brand.upper()}' but is NOT the official VPA!")
                     break
         
-        # Typosquatting
+        # Rule: Catch potential typosquatting using numeric characters in business names
         if re.search(r'\d+', vpa_prefix) and len(vpa_prefix) > 5:
             score += 15
             reasons.append("⚠️ Suspicious Pattern: Numbers in merchant name - Possible typosquatting")
         
-        # Personal account
+        # Rule: Flag consumer handles used for high-risk corporate transaction flows
         personal_suffixes = ['@sbi', '@ybl', '@okaxis', '@oksbi', '@paytm', '@icici', '@hdfc']
         if any(norm_vpa.endswith(suffix) for suffix in personal_suffixes):
             score += 10
@@ -153,9 +158,12 @@ class FraudEngine:
         return min(score, 100), reasons
 
     def analyze_qr_deep(self, payload, user_amt):
+        # --- DEEP QR PAYLOAD ANALYSIS BLOCK ---
+        # Decodes QR URI parameters to scan for amount manipulation, currency anomalies, and scam notes[cite: 2]
         if not payload:
             return 0, [], None, ""
 
+        # Rule: Validate URI protocol header to block arbitrary phishing links
         if not payload.startswith("upi://pay"):
             return 100, ["🚨 CRITICAL: This is NOT a UPI payment QR! Possible phishing attempt."], None, "Non-UPI"
 
@@ -170,6 +178,11 @@ class FraudEngine:
         am = params.get('am', None)
         tn = params.get('tn', '')
         cu = params.get('cu', 'INR')
+        
+        # NEW SCAM VECTOR: Collect Request (Reverse UPI Scam) detection
+        tr_mode = params.get('mode', '').lower()
+        if 'collect' in payload.lower() or tr_mode == '02' or params.get('sign') == 'collect':
+            return 100, ["🚨 COLLECT REQUEST WARNING: This is a reverse payment request! Entering your PIN will DEBIT your account, not credit it."], pa, pn
 
         score = 0
         reasons = []
@@ -178,6 +191,26 @@ class FraudEngine:
             score += 40
             reasons.append("⚠️ Invalid QR: No payee address (pa) found in QR")
         
+        # =========================================================================
+        # NEW SCAM VECTOR: QR-on-QR / Standee Overlay & Sticker Swap Detection
+        # =========================================================================
+        # Scammers paste a fake QR sticker (with a personal VPA handle) on top of a shop standee.
+        # Check if the payee name (pn) looks like a business, but the VPA uses a personal/mobile handle 
+        # and is missing from the system's verified merchant database.
+        if pn and pa:
+            conn = self.get_db_connection()
+            is_verified = conn.execute("SELECT 1 FROM merchants WHERE vpa=?", (pa,)).fetchone()
+            conn.close()
+            
+            # Check if VPA looks like a personal identifier (contains numbers or mobile patterns, or uses personal bank handles)
+            is_personal_vpa = bool(re.search(r'\d{8,}', pa) or any(pa.endswith(s) for s in ['@ybl', '@paytm', '@oksbi', '@okaxis']))
+            
+            # If the QR claims a business/store name in 'pn' but resolves to an unverified personal handle
+            if is_personal_vpa and not is_verified:
+                score += 60
+                reasons.append(f"🚨 STANDEE SWAP / QR OVERLAY DETECTED: QR claims payee name '{pn}', but resolves to an unverified personal handle ({pa}). Verify if a physical sticker was pasted over the store standee!")
+
+        # Rule: Check if embedded amount fields inside the QR differ from user input (Amount Tampering)
         if am and user_amt and user_amt > 0:
             try:
                 qr_amount = float(am)
@@ -187,6 +220,7 @@ class FraudEngine:
             except ValueError:
                 pass
         
+        # Rule: Flag phishing keywords inside the transaction notes (tn)
         suspicious_notes = ['refund', 'cashback', 'reward', 'lottery', 'prize', 'winner']
         if tn:
             tn_lower = tn.lower()
@@ -203,13 +237,14 @@ class FraudEngine:
         return min(score, 100), reasons, pa, pn
 
     def behavioral_check(self, vpa, amt, username):
+        # --- BEHAVIORAL & VELOCITY ANALYSIS BLOCK ---
+        # Benchmarks transaction amounts against averages and monitors rapid-fire sending frequency[cite: 2]
         score = 0
         reasons = []
         
         if not username:
             username = "default"
         
-        # Initialize user history if needed
         if username not in self.user_history:
             self.user_history[username] = []
         
@@ -217,7 +252,6 @@ class FraudEngine:
             self.vpa_history[username] = {}
         
         now = datetime.now()
-        
         conn = self.get_db_connection()
         norm_vpa = self.normalize_vpa(vpa)
         
@@ -227,24 +261,36 @@ class FraudEngine:
                 "SELECT amt FROM logs WHERE vpa=? AND username=? ORDER BY ts DESC LIMIT 10", 
                 (norm_vpa, username)
             ).fetchall()
-        except Exception as e:
-            print(f"Database query error: {e}")
+            
+            # SCAM VECTOR: Fake Accidental Overpayment / Refund Verification
+            incoming_credits = conn.execute(
+                "SELECT COUNT(*) as count FROM logs WHERE username=? AND vpa=? AND status='Safe'", 
+                (username, norm_vpa)
+            ).fetchone()['count']
+            
+        except Exception as _e:
             m_data = None
             past_tx_query = []
+            incoming_credits = 1
         
         conn.close()
         
-        # ========== FIX: Amount exactly 5x merchant average (>= instead of >) ==========
+        # Rule: Trigger fraud alerts if sending money to a new VPA claiming a "refund" with no actual transaction history
+        if incoming_credits == 0 and amt > 1000:
+            score += 35
+            reasons.append(f"⚠️ REFUND SCAM WARNING: Attempting to pay ₹{amt:.2f} to a VPA with zero prior payment history. Verify if you actually received funds first!")
+        
+        # Rule: Flag sudden spikes >= 5x or >= 3x the standard merchant average amount[cite: 2]
         if m_data and m_data['avg_amt'] and m_data['avg_amt'] > 0:
             avg_amt = m_data['avg_amt']
-            if amt >= avg_amt * 5:  # Changed from > to >=
+            if amt >= avg_amt * 5:
                 score += 45
                 reasons.append(f"🚨 SUDDEN SPIKE: ₹{amt:.2f} is 5x or higher than merchant average (₹{avg_amt:.2f})")
-            elif amt >= avg_amt * 3:  # Changed from > to >=
+            elif amt >= avg_amt * 3:
                 score += 25
                 reasons.append(f"⚠️ High Amount: ₹{amt:.2f} is 3x or higher than merchant average (₹{avg_amt:.2f})")
         
-        # Amount spike vs personal history
+        # Rule: Flag amounts significantly higher than the user's personal historical average[cite: 2]
         if past_tx_query and len(past_tx_query) >= 2:
             past_amounts = [tx['amt'] for tx in past_tx_query[:5]]
             if past_amounts:
@@ -253,38 +299,23 @@ class FraudEngine:
                     score += 30
                     reasons.append(f"⚠️ Unusual Amount: Much higher than your usual transactions (avg ₹{personal_avg:.2f})")
         
-        # ========== FIX: Rapid transactions across DIFFERENT VPAs ==========
-        # Clean old entries (older than 2 minutes)
+        # Time-window cleaning (2 minutes rolling threshold) for velocity metrics[cite: 2]
         cutoff = now - timedelta(minutes=2)
         self.user_history[username] = [t for t in self.user_history[username] if t > cutoff]
-        
-        # Add current transaction timestamp
         self.user_history[username].append(now)
         
-        # Check velocity - counts ALL transactions by this user (regardless of VPA)
-        tx_count = len(self.user_history[username])
-        
-        #if tx_count > 3:
-         #     score += 35
-          #  reasons.append(f"🚨 RAPID TRANSACTIONS: {tx_count} attempts in last 2 minutes - Possible automated fraud (detected across different VPAs)")
-        #elif tx_count > 2:
-         #   score += 15
-          #  reasons.append(f"⚠️ High Frequency: {tx_count} transactions in last 2 minutes")
-        
-        # Also track per-VPA for additional detection
+        # Rule: Track rapid-fire repeated payment attempts directed to the exact same VPA[cite: 2]
         if norm_vpa not in self.vpa_history[username]:
             self.vpa_history[username][norm_vpa] = []
         
-        # Clean per-VPA history
         self.vpa_history[username][norm_vpa] = [t for t in self.vpa_history[username][norm_vpa] if t > cutoff]
         self.vpa_history[username][norm_vpa].append(now)
         
-        # If rapid on same VPA, add extra penalty
         if len(self.vpa_history[username][norm_vpa]) > 2:
             score += 15
             reasons.append(f"🚨 Rapid payments to SAME VPA: {len(self.vpa_history[username][norm_vpa])} in 2 minutes")
         
-        # Round number detection
+        # Rule: Note round amounts that can indicate automated bot testing or bulk scams[cite: 2]
         if amt > 0 and amt % 1000 == 0 and amt < 10000:
             score += 5
             reasons.append("ℹ️ Round amount detected - Verify carefully")
