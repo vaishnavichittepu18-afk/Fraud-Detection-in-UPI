@@ -6,7 +6,7 @@ import re
 import os
 
 app = Flask(__name__)
-app.secret_key = 'bank_security_secret_2024'
+app.secret_key = os.environ.get("FLASK_SECRET_KEY")
 
 engine = FraudEngine()
 
@@ -93,10 +93,25 @@ def init_database():
         (vpa TEXT PRIMARY KEY, reason TEXT, blocked_at TEXT)''')
     
     # Add default users
-    conn.execute("INSERT OR IGNORE INTO users VALUES ('admin', '123')")
-    conn.execute("INSERT OR IGNORE INTO users VALUES ('test', 'test')")
-    conn.execute("INSERT OR IGNORE INTO users VALUES ('student1', '123')")
-    conn.execute("INSERT OR IGNORE INTO users VALUES ('student2', '123')")
+    conn.execute(
+    "INSERT OR IGNORE INTO users VALUES (?, ?)",
+    ('admin', generate_password_hash('123'))
+    )
+    
+    conn.execute(
+        "INSERT OR IGNORE INTO users VALUES (?, ?)",
+        ('test', generate_password_hash('test'))
+    )
+    
+    conn.execute(
+        "INSERT OR IGNORE INTO users VALUES (?, ?)",
+        ('student1', generate_password_hash('123'))
+    )
+    
+    conn.execute(
+        "INSERT OR IGNORE INTO users VALUES (?, ?)",
+        ('student2', generate_password_hash('123'))
+    )
     
     # Add default merchants
     merchants = [
@@ -133,10 +148,14 @@ def login():
         pw = data.get('password', '').strip()
 
         db = get_db()
-        account = db.execute("SELECT * FROM users WHERE username=? AND password=?", (user, pw)).fetchone()
+        account = db.execute(
+            "SELECT * FROM users WHERE username=?",
+            (user,)
+        ).fetchone()
+        
         db.close()
-
-        if account:
+        
+        if account and check_password_hash(account['password'], pw):
             session['logged_in'] = True
             session['user'] = user
             return jsonify({"status": "success"})
